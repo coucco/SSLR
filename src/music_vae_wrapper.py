@@ -1,17 +1,15 @@
 import os
-import glob
 import urllib.request
 import tarfile
 from pathlib import Path
-from typing import List, Optional
 import numpy as np
-
 import note_seq
 from magenta.models.music_vae import configs
 from magenta.models.music_vae.trained_model import TrainedModel
 
+
 class MusicVAEWrapper:
-    """Обертка для работы с Music VAE"""
+    """Обертка для работы с Music VAE (оригинальный код из Colab)"""
     
     def __init__(self, model_name: str, checkpoint_dir: Path, batch_size: int = 32):
         self.model_name = model_name
@@ -20,38 +18,31 @@ class MusicVAEWrapper:
         self.model = None
         
     def download_if_needed(self):
-        """Скачивает веса модели если их нет"""
+        """Скачивает веса модели если их нет (как в Colab)"""
         ckpt_path = self.checkpoint_dir / f"{self.model_name}.tar"
         extracted_dir = self.checkpoint_dir / self.model_name
         
         if not extracted_dir.exists():
-            print(f"Downloading Music VAE weights ({self.model_name})...")
+            print(f'Downloading Music VAE weights ({self.model_name})...')
             url = f"https://storage.googleapis.com/magentadata/models/music_vae/checkpoints/{self.model_name}.tar"
-            
-            # Скачиваем
             urllib.request.urlretrieve(url, ckpt_path)
-            
-            # Распаковываем
             with tarfile.open(ckpt_path, 'r') as tar:
                 tar.extractall(self.checkpoint_dir)
-            
             os.remove(ckpt_path)
-            print("Download complete.")
-        
+            print('Downloaded.')
         return extracted_dir
     
     def load(self):
-        """Загружает модель"""
+        """Загружает модель Music VAE"""
         extracted_dir = self.download_if_needed()
-        
-        print("Loading Music VAE...")
+        print('Loading Music VAE...')
         musicvae_config = configs.CONFIG_MAP[self.model_name]
         self.model = TrainedModel(
             config=musicvae_config,
             batch_size=self.batch_size,
             checkpoint_dir_or_path=str(extracted_dir),
         )
-        print("Music VAE loaded successfully.")
+        print('Music VAE loaded successfully.')
         return self.model
     
     def encode(self, sequences):
