@@ -1,41 +1,24 @@
-#!/usr/bin/env python3
-"""
-Structured Controller для генерации музыки
-Запуск: python main.py
-"""
+import magenta
+print('Magenta version:', magenta.__version__)
 
-import sys
-import os
-import json
-import time
-import random
-import glob
-import urllib.request
-import tarfile
+import json, time, random, glob
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
+print('PyTorch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import pretty_midi
-import tensorflow as tf
 import note_seq
-from magenta.models.music_vae import configs
-from magenta.models.music_vae.trained_model import TrainedModel
-from tqdm import tqdm
-from sklearn.decomposition import PCA
 
-# Отключаем лишние предупреждения
+# TensorFlow (нужен для Music VAE)
+import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# ============================================================
-# НАСТРОЙКИ
-# ============================================================
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'PyTorch device: {DEVICE}')
@@ -56,23 +39,31 @@ for d in [DATA_DIR, CKPT_DIR, OUTPUT_DIR, MIDI_DIR]:
 CFG = {
     'musicvae_z_dim': 512,
     'musicvae_model': 'cat-mel_2bar_big',
-    'z_struct_dim': 128,
-    'z_energy_dim': 64,
-    'z_rhythm_dim': 100,
-    'z_harmony_dim': 110,
-    'z_melody_dim': 110,
-    'hidden_dim': 1024,
+    
+    # УВЕЛИЧИВАЕМ размерности компонентов
+    'z_struct_dim': 128,    # было 64
+    'z_energy_dim': 128,     # было 32
+    'z_rhythm_dim': 256,    # было 64 ← важно!
+    'z_harmony_dim': 256,   # было 64 ← важно!
+    'z_melody_dim': 256,    # было 64 ← важно!
+    
+    'hidden_dim': 256,      # оставляем
+    
+    # Балансируем веса
     'lambda_recon': 1.0,
-    'lambda_kl': 0.5,
-    'lambda_energy': 2.0,
-    'lambda_role': 1.5,
-    'lambda_dis': 0.3,
-    'kl_warmup': 10,
-    'batch_size': 32,  # Уменьшаем для стабильности
-    'lr': 3e-4,
-    'n_epochs': 10,    # Тестовый запуск
+    'lambda_kl': 0.005,     # чуть меньше
+    'lambda_energy': 3.0,   # УМЕНЬШАЕМ с 2.0 до 1.0
+    'lambda_role': 2.5,     # УВЕЛИЧИВАЕМ для ролей
+    'lambda_dis': 0.1,
+    'kl_warmup': 30,
+    
+    'batch_size': 256,
+    'lr': 1e-4,
+    'n_epochs': 300,         # Больше эпох
+    
     'seed': 42,
-    'max_midi_files': 500,  # Ограничиваем для теста
+    'max_midi_files': 10000,  # Больше данных!
+    'num_workers': 4,
 }
 
 CFG['z_total'] = sum([CFG['z_struct_dim'], CFG['z_energy_dim'], 
@@ -83,20 +74,90 @@ random.seed(CFG['seed'])
 np.random.seed(CFG['seed'])
 torch.manual_seed(CFG['seed'])
 
+
 # ============================================================
-# ЗАГРУЗКА MUSIC VAE (ручное скачивание)
+# ФИЛЬТРАЦИЯ MIDI ПО РОЛЯМ
+# ============================================================
+
+def count_roles_in_midi(midi_path: str) -> int:
+    """
+    Подсчитывает количество ролей в MIDI файле:
+    - rhythm (drums)
+    - harmony (bass или низкие ноты)
+    - melody (высокие ноты)
+    Возвращает количество ролей (0-3)
+    """
+    try:
+        pm = pretty_midi.PrettyMIDI(midi_path)
+    except Exception:
+        return 0
+
+    has_drums = False
+    has_bass = False
+    has_melody = False
+
+    for inst in pm.instruments:
+        if inst.is_drum and len(inst.notes) > 0:
+            has_drums = True
+        elif inst.program in range(32, 40) and len(inst.notes) > 0:  # Bass instruments
+            has_bass = True
+        else:
+            # Для остальных инструментов проверяем высоту нот
+            if len(inst.notes) > 0:
+                avg_pitch = np.mean([n.pitch for n in inst.notes])
+                if avg_pitch < 55:  # Низкие ноты → гармония
+                    has_bass = True
+                else:  # Высокие ноты → мелодия
+                    has_melody = True
+
+    return sum([has_drums, has_bass, has_melody])
+
+
+def filter_midi_by_roles(midi_dir: Path, min_roles: int = 2, max_files: int = 5000):
+    """
+    Фильтрует MIDI файлы, оставляя только те, у которых >= min_roles ролей
+    """
+    import shutil
+
+    midi_files = list(midi_dir.rglob('*.mid')) + list(midi_dir.rglob('*.midi'))
+    print(f"Total MIDI files found: {len(midi_files)}")
+
+    # Создаём папку для отфильтрованных файлов
+    filtered_dir = midi_dir.parent / f'filtered_{min_roles}_roles'
+    filtered_dir.mkdir(parents=True, exist_ok=True)
+
+    roles_distribution = {0: 0, 1: 0, 2: 0, 3: 0}
+    filtered_files = []
+
+    print(f"Filtering MIDI files (min_roles={min_roles})...")
+    for f in tqdm(midi_files, desc='Checking roles'):
+        role_count = count_roles_in_midi(str(f))
+        roles_distribution[role_count] += 1
+        if role_count >= min_roles:
+            filtered_files.append(f)
+            # Копируем в отфильтрованную папку
+            shutil.copy(f, filtered_dir / f.name)
+
+    print(f"\nRoles distribution:")
+    print(f"  0 roles: {roles_distribution[0]} files")
+    print(f"  1 role:  {roles_distribution[1]} files")
+    print(f"  2 roles: {roles_distribution[2]} files")
+    print(f"  3 roles: {roles_distribution[3]} files")
+    print(f"\n✅ Kept {len(filtered_files)} files with >= {min_roles} roles")
+    print(f"📁 Saved to: {filtered_dir}")
+
+    return filtered_dir, filtered_files[:max_files]
+
+# ============================================================
+# ЗАГРУЗКА MUSIC VAE
 # ============================================================
 
 from magenta.models.music_vae import configs
 from magenta.models.music_vae.trained_model import TrainedModel
-import glob
 
 MODEL_NAME = CFG['musicvae_model']
-
-# Путь к папке с чекпоинтами (без подпапки MODEL_NAME)
 MUSICVAE_DIR = PROJECT_ROOT / 'data' / 'checkpoints' / 'music_vae'
 
-# Ищем файл чекпоинта
 ckpt_files = glob.glob(str(MUSICVAE_DIR / f"{MODEL_NAME}.ckpt.index"))
 if ckpt_files:
     checkpoint_path = ckpt_files[0].replace('.index', '')
@@ -112,71 +173,67 @@ musicvae = TrainedModel(
 )
 print('Music VAE loaded successfully.')
 
-# Тестовая генерация
-test_seqs = musicvae.sample(n=2, length=32, temperature=0.5)
-note_seq.sequence_proto_to_midi_file(test_seqs[0], str(OUTPUT_DIR / 'test_musicvae.mid'))
-print(f'Test MIDI saved to {OUTPUT_DIR}/test_musicvae.mid')
-
 # ============================================================
-# ФУНКЦИИ ДЛЯ РАБОТЫ С MIDI (упрощенные, без требования всех ролей)
+# ФУНКЦИИ ДЛЯ MIDI
 # ============================================================
-
-BASS_PROGRAMS = set(range(32, 40))
-
-def assign_role(inst):
-    if inst.is_drum:
-        return 'rhythm'
-    if inst.program in BASS_PROGRAMS:
-        return 'harmony'
-    if inst.notes and np.mean([n.pitch for n in inst.notes]) < 48:
-        return 'harmony'
-    return 'melody'
-
-def midi_to_note_seq(midi_path: str):
-    try:
-        return note_seq.midi_file_to_note_sequence(midi_path)
-    except Exception:
-        return None
 
 def extract_piano_roll(midi_path: str, fs: int = 8, clip_frames: int = 256) -> np.ndarray:
-    """ВСЕГДА возвращает массив нужной формы"""
+    """
+    Извлекает piano-roll с РАЗНЫМИ каналами для разных ролей:
+    - Канал 0: ритм (ударные)
+    - Канал 1: гармония (бас и низкие ноты)
+    - Канал 2: мелодия (высокие ноты)
+    """
     try:
         pm = pretty_midi.PrettyMIDI(midi_path)
     except Exception:
         return np.zeros((clip_frames, 128, 3), dtype=np.float32)
     
-    # Собираем все ноты
-    all_notes = []
+    # Разделяем ноты по ролям
+    rhythm_notes = []   # ударные
+    harmony_notes = []  # бас и низкие ноты
+    melody_notes = []   # высокие ноты
+    
     for inst in pm.instruments:
-        for note in inst.notes:
-            if 0 <= note.pitch <= 127:
-                all_notes.append(note)
+        if inst.is_drum:
+            rhythm_notes.extend(inst.notes)
+        elif inst.program in range(32, 40):  # Bass instruments (Electric Bass, Acoustic Bass, etc.)
+            harmony_notes.extend(inst.notes)
+        else:
+            # Сортируем по высоте нот
+            for note in inst.notes:
+                if note.pitch < 55:  # Низкие ноты (ниже E4) → гармония
+                    harmony_notes.append(note)
+                else:  # Высокие ноты → мелодия
+                    melody_notes.append(note)
     
-    if len(all_notes) == 0:
-        return np.zeros((clip_frames, 128, 3), dtype=np.float32)
+    # Создаём три разных piano-roll
+    rolls = {}
+    for role_name, notes in [('rhythm', rhythm_notes), ('harmony', harmony_notes), ('melody', melody_notes)]:
+        tmp = pretty_midi.PrettyMIDI()
+        if notes:
+            inst = pretty_midi.Instrument(program=0, is_drum=(role_name == 'rhythm'))
+            inst.notes = notes
+            tmp.instruments.append(inst)
+        
+        try:
+            roll = tmp.get_piano_roll(fs=fs)
+        except Exception:
+            roll = np.zeros((128, clip_frames))
+        
+        # Приводим к нужной длине
+        if roll.shape[1] < clip_frames:
+            pad = np.zeros((128, clip_frames - roll.shape[1]))
+            roll = np.hstack([roll, pad])
+        else:
+            roll = roll[:, :clip_frames]
+        
+        rolls[role_name] = (roll > 0).astype(np.float32)
     
-    # Создаем MIDI с этими нотами
-    tmp = pretty_midi.PrettyMIDI()
-    inst = pretty_midi.Instrument(program=0)
-    inst.notes = all_notes
-    tmp.instruments.append(inst)
+    # Собираем в стек (T, 128, 3) - три РАЗНЫХ канала!
+    stack = np.stack([rolls['rhythm'], rolls['harmony'], rolls['melody']], axis=-1).transpose(1, 0, 2)
     
-    try:
-        roll = tmp.get_piano_roll(fs=fs)
-    except Exception:
-        return np.zeros((clip_frames, 128, 3), dtype=np.float32)
-    
-    # Приводим к нужной длине
-    if roll.shape[1] < clip_frames:
-        pad = np.zeros((128, clip_frames - roll.shape[1]))
-        roll = np.hstack([roll, pad])
-    else:
-        roll = roll[:, :clip_frames]
-    
-    roll = (roll > 0).astype(np.float32)
-    roll_3ch = np.stack([roll, roll, roll], axis=-1).transpose(1, 0, 2)
-    
-    return roll_3ch.astype(np.float32)
+    return stack.astype(np.float32)
 
 def compute_energy(roll: np.ndarray, alpha: float = 0.5) -> np.ndarray:
     density = roll.sum(axis=(1, 2)) / (128 * 3)
@@ -186,7 +243,10 @@ def compute_energy(roll: np.ndarray, alpha: float = 0.5) -> np.ndarray:
 # ПОДГОТОВКА ДАННЫХ
 # ============================================================
 
-# ── Encode всех MIDI через Music VAE (принимает ВСЕ файлы) ──
+# ============================================================
+# ПОДГОТОВКА ДАННЫХ С ФИЛЬТРАЦИЕЙ
+# ============================================================
+
 Z_CACHE = DATA_DIR / 'musicvae_z_vectors.npy'
 ROLL_CACHE = DATA_DIR / 'piano_rolls.npy'
 ENERGY_CACHE = DATA_DIR / 'energy_profiles.npy'
@@ -198,35 +258,44 @@ if Z_CACHE.exists() and ROLL_CACHE.exists():
     energy_all = np.load(ENERGY_CACHE)
     print(f'Loaded: {len(z_musicvae_all)} samples')
 else:
-    midi_files = (glob.glob(str(MIDI_DIR / '**/*.mid'), recursive=True) +
-                  glob.glob(str(MIDI_DIR / '**/*.midi'), recursive=True))
+    # Используем отфильтрованную папку если она есть, иначе исходную
+    filtered_dir = MIDI_DIR.parent / 'filtered_2_roles'
+    if filtered_dir.exists() and len(list(filtered_dir.glob('*.mid'))) > 0:
+        midi_dir = filtered_dir
+        print(f"Using filtered MIDI directory: {midi_dir}")
+    else:
+        midi_dir = MIDI_DIR
+        print(f"Using original MIDI directory: {midi_dir}")
+        print("Consider filtering first: python filter_midi.py")
+    
+    # Поиск всех MIDI файлов
+    midi_files = list(midi_dir.glob('*.mid')) + list(midi_dir.glob('*.midi'))
     random.shuffle(midi_files)
     midi_files = midi_files[:CFG['max_midi_files']]
+    
     print(f'Processing {len(midi_files)} MIDI files...')
-
+    
+    # Проверяем роли для статистики
+    roles_count = []
+    for f in tqdm(midi_files, desc='Checking roles'):
+        rc = count_roles_in_midi(str(f))
+        roles_count.append(rc)
+    
+    print(f"Roles in selected files: 0:{roles_count.count(0)}, 1:{roles_count.count(1)}, 2:{roles_count.count(2)}, 3:{roles_count.count(3)}")
+    
     z_list, roll_list, energy_list = [], [], []
     
-    from tqdm import tqdm
-    
     for midi_path in tqdm(midi_files, desc='Encoding MIDI'):
-        # Всегда получаем roll (даже если пустой)
-        roll = extract_piano_roll(midi_path)
+        roll = extract_piano_roll(str(midi_path))
         
-        # Всегда получаем NoteSequence (даже если пустой)
         try:
             ns = note_seq.midi_file_to_note_sequence(str(midi_path))
-        except Exception:
-            ns = note_seq.NoteSequence()
-        
-        # Пробуем закодировать, но если не получается - создаем случайный z
-        try:
-            z_batch, _, _ = musicvae.encode([ns])
+            z_batch = musicvae.encode([ns])
             if isinstance(z_batch, list):
                 z = z_batch[0]
             else:
                 z = z_batch[0]
-        except Exception:
-            # Если encode не работает - создаем случайный z
+        except Exception as e:
             z = np.random.randn(512).astype(np.float32)
         
         z_list.append(z)
@@ -244,10 +313,13 @@ else:
     np.save(ENERGY_CACHE, energy_all)
     print(f'Saved to {DATA_DIR}')
 
-print(f'Dataset shapes: z_musicvae {z_musicvae_all.shape}, rolls {rolls_all.shape}')
+print(f'\nDataset shapes:')
+print(f'  z_musicvae: {z_musicvae_all.shape}   (N, 512)')
+print(f'  rolls:      {rolls_all.shape}   (N, T, 128, 3)')
+print(f'  energy:     {energy_all.shape}  (N, T)')
 
 # ============================================================
-# DATASET И DATALOADER
+# ДАТАСЕТ И ДАТАЛОАДЕР
 # ============================================================
 
 class ZDataset(Dataset):
@@ -275,7 +347,9 @@ test_loader = DataLoader(test_ds, batch_size=CFG['batch_size'], shuffle=False)
 
 ROLL_FLAT_DIM = rolls_all.shape[1] * 128 * 3
 T_FRAMES = rolls_all.shape[1]
+
 print(f'Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}')
+print(f'Roll flat dim: {ROLL_FLAT_DIM}')
 
 # ============================================================
 # МОДЕЛЬ
@@ -284,10 +358,10 @@ print(f'Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}')
 def mlp(dims, activation=nn.GELU, norm=True):
     layers = []
     for i in range(len(dims) - 1):
-        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        layers.append(nn.Linear(dims[i], dims[i+1]))
         if i < len(dims) - 2:
             if norm:
-                layers.append(nn.LayerNorm(dims[i + 1]))
+                layers.append(nn.LayerNorm(dims[i+1]))
             layers.append(activation())
     return nn.Sequential(*layers)
 
@@ -299,7 +373,9 @@ class ComponentEncoder(nn.Module):
         self.lv_head = nn.Linear(hidden // 2, out_dim)
     def forward(self, x):
         h = self.net(x)
-        return self.mu_head(h), self.lv_head(h).clamp(-4, 4)
+        mu = self.mu_head(h)
+        lv = self.lv_head(h).clamp(-5, 2)  # ← Ограничиваем logvar!
+        return mu, lv
 
 class StructuredController(nn.Module):
     def __init__(self, cfg, roll_flat_dim, t_frames):
@@ -339,15 +415,20 @@ class StructuredController(nn.Module):
         B = x_flat.size(0)
         T = self.t
         x3d = x_flat.view(B, T, 128, 3)
-        xr = x3d[:, :, :, 0].reshape(B, -1)
-        xh = x3d[:, :, :, 1].reshape(B, -1)
-        xm = x3d[:, :, :, 2].reshape(B, -1)
-        
-        ms, ls = self.struct_enc(x_flat)
-        me, le = self.energy_enc(x_flat)
+    
+        # Только ролевые энкодеры!
+        xr = x3d[:, :, :, 0].reshape(B, -1)  # rhythm
+        xh = x3d[:, :, :, 1].reshape(B, -1)  # harmony
+        xm = x3d[:, :, :, 2].reshape(B, -1)  # melody
+    
         mr, lr = self.rhythm_enc(xr)
         mh, lh = self.harmony_enc(xh)
         mm, lm = self.melody_enc(xm)
+    
+        # struct и energy генерируем из объединённых ролей
+        x_combined = torch.cat([xr, xh, xm], dim=1)
+        ms, ls = self.struct_enc(x_combined)
+        me, le = self.energy_enc(x_combined)
         
         return dict(mu=dict(struct=ms, energy=me, rhythm=mr, harmony=mh, melody=mm),
                    lv=dict(struct=ls, energy=le, rhythm=lr, harmony=lh, melody=lm))
@@ -391,6 +472,8 @@ def kl_div(enc):
     kl = 0.0
     for k in enc['mu']:
         mu, lv = enc['mu'][k], enc['lv'][k]
+        # Ограничиваем logvar, чтобы не уходил в -∞
+        lv = lv.clamp(-5, 2)
         kl += -0.5 * (1 + lv - mu.pow(2) - lv.exp()).sum(dim=1).mean()
     return kl
 
@@ -416,10 +499,12 @@ def total_loss(out, z_mv_target, x_flat, energy, cfg, beta):
                    'role': role_loss.item(), 'dis': dis_loss.item(), 'total': total.item()}
 
 def beta_schedule(epoch, cfg):
-    return min(cfg['lambda_kl'], cfg['lambda_kl'] * epoch / cfg['kl_warmup'])
+    if epoch < 5:  # Всего 5 эпох без KL
+        return 0.0
+    return min(cfg['lambda_kl'], cfg['lambda_kl'] * (epoch - 5) / cfg['kl_warmup'])
 
 # ============================================================
-# ОБУЧЕНИЕ
+# ОБУЧЕНИЕ С СОХРАНЕНИЕМ ИСТОРИИ
 # ============================================================
 
 controller = StructuredController(CFG, ROLL_FLAT_DIM, T_FRAMES).to(DEVICE)
@@ -428,7 +513,9 @@ print(f'Controller parameters: {sum(p.numel() for p in controller.parameters()):
 optimizer = torch.optim.AdamW(controller.parameters(), lr=CFG['lr'], weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG['n_epochs'], eta_min=1e-5)
 
-history = {'train_total': [], 'val_total': []}
+# Расширенная история для всех компонентов loss
+history = {k: [] for k in ['train_total', 'train_recon', 'train_kl', 'train_energy', 'train_role', 'train_dis',
+                           'val_total', 'val_recon', 'val_kl', 'val_energy', 'val_role', 'val_dis']}
 best_val = float('inf')
 
 print('\nStarting training...')
@@ -438,47 +525,196 @@ for epoch in range(1, CFG['n_epochs'] + 1):
     
     # Train
     controller.train()
-    train_loss = 0
+    train_sums = {k: 0.0 for k in ['total', 'recon', 'kl', 'energy', 'role', 'dis']}
     for z_mv, x_flat, energy in train_loader:
         z_mv, x_flat, energy = z_mv.to(DEVICE), x_flat.to(DEVICE), energy.to(DEVICE)
         optimizer.zero_grad()
         out = controller(x_flat)
-        loss, _ = total_loss(out, z_mv, x_flat, energy, CFG, beta)
+        loss, parts = total_loss(out, z_mv, x_flat, energy, CFG, beta)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(controller.parameters(), 1.0)
         optimizer.step()
-        train_loss += loss.item()
-    train_loss /= len(train_loader)
+        for k, v in parts.items():
+            train_sums[k] += v
+    train_metrics = {k: v / len(train_loader) for k, v in train_sums.items()}
     
     # Validation
     controller.eval()
-    val_loss = 0
+    val_sums = {k: 0.0 for k in ['total', 'recon', 'kl', 'energy', 'role', 'dis']}
     with torch.no_grad():
         for z_mv, x_flat, energy in val_loader:
             z_mv, x_flat, energy = z_mv.to(DEVICE), x_flat.to(DEVICE), energy.to(DEVICE)
             out = controller(x_flat)
-            loss, _ = total_loss(out, z_mv, x_flat, energy, CFG, beta)
-            val_loss += loss.item()
-    val_loss /= len(val_loader)
+            _, parts = total_loss(out, z_mv, x_flat, energy, CFG, beta)
+            for k, v in parts.items():
+                val_sums[k] += v
+    val_metrics = {k: v / len(val_loader) for k, v in val_sums.items()}
     
     scheduler.step()
-    history['train_total'].append(train_loss)
-    history['val_total'].append(val_loss)
     
-    if val_loss < best_val:
-        best_val = val_loss
-        torch.save({'epoch': epoch, 'model_state': controller.state_dict(), 'best_val': best_val}, 
+    # Сохраняем историю
+    for k, v in train_metrics.items():
+        history[f'train_{k}'].append(v)
+    for k, v in val_metrics.items():
+        history[f'val_{k}'].append(v)
+    
+    if val_metrics['total'] < best_val:
+        best_val = val_metrics['total']
+        torch.save({'epoch': epoch, 'model_state': controller.state_dict(), 'best_val': best_val, 'cfg': CFG}, 
                   CKPT_DIR / 'best.pt')
     
     if epoch % 5 == 0 or epoch == 1:
-        print(f'Epoch {epoch:3d}/{CFG["n_epochs"]} | train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f} | time: {time.time()-t0:.1f}s')
+        print(f'Epoch {epoch:3d}/{CFG["n_epochs"]} β={beta:.3f} | '
+              f'tr: {train_metrics["total"]:.4f} (rec={train_metrics["recon"]:.4f} '
+              f'kl={train_metrics["kl"]:.3f} role={train_metrics["role"]:.4f}) | '
+              f'val: {val_metrics["total"]:.4f} | {time.time()-t0:.1f}s')
 
 with open(CKPT_DIR / 'history.json', 'w') as f:
     json.dump(history, f)
 print(f'\nBest val loss: {best_val:.4f}')
 
+# Загрузка лучшей модели
+ckpt = torch.load(CKPT_DIR / 'best.pt', map_location=DEVICE)
+controller.load_state_dict(ckpt['model_state'])
+controller.eval()
+print(f'Loaded best checkpoint: epoch={ckpt["epoch"]}, val={ckpt["best_val"]:.4f}')
+
 # ============================================================
-# ГЕНЕРАЦИЯ
+# МЕТРИКИ НА ТЕСТОВОЙ ВЫБОРКЕ
+# ============================================================
+
+print('\n' + '='*55)
+print('Computing test metrics...')
+print('='*55)
+
+controller.eval()
+metrics = {'z_recon_mse': [], 'energy_corr': [], 'inter_track_corr': [], 'tc_score': []}
+kl_per_comp = {k: [] for k in ['struct', 'energy', 'rhythm', 'harmony', 'melody']}
+
+with torch.no_grad():
+    for z_mv, x_flat, energy in test_loader:
+        z_mv = z_mv.to(DEVICE)
+        x_flat = x_flat.to(DEVICE)
+        energy = energy.to(DEVICE)
+        
+        out = controller(x_flat)
+        
+        mse = F.mse_loss(out['z_mv_hat'], z_mv).item()
+        metrics['z_recon_mse'].append(mse)
+        
+        e_pred = out['e_pred'].cpu().numpy()
+        e_true = energy.cpu().numpy()
+        for b in range(e_pred.shape[0]):
+            if e_true[b].std() > 1e-6 and e_pred[b].std() > 1e-6:
+                metrics['energy_corr'].append(float(np.corrcoef(e_true[b], e_pred[b])[0, 1]))
+        
+        B = x_flat.size(0)
+        h_out = torch.sigmoid(out['h_pred']).cpu().numpy().reshape(B, T_FRAMES, 128)
+        m_out = torch.sigmoid(out['m_pred']).cpu().numpy().reshape(B, T_FRAMES, 128)
+        for b in range(B):
+            hd = h_out[b].sum(axis=1)
+            md = m_out[b].sum(axis=1)
+            if hd.std() > 1e-6 and md.std() > 1e-6:
+                metrics['inter_track_corr'].append(float(np.corrcoef(hd, md)[0, 1]))
+        
+        tc = tc_penalty(out['z_parts']).item()
+        metrics['tc_score'].append(tc)
+        
+        for comp in kl_per_comp:
+            mu = out['enc']['mu'][comp]
+            lv = out['enc']['lv'][comp]
+            kl_c = -0.5 * (1 + lv - mu.pow(2) - lv.exp()).mean().item()
+            kl_per_comp[comp].append(kl_c)
+
+final_metrics = {k: float(np.mean(v)) for k, v in metrics.items()}
+final_metrics['kl_per_component'] = {k: float(np.mean(v)) for k, v in kl_per_comp.items()}
+
+print(f'\n  z_recon_mse     : {final_metrics["z_recon_mse"]:.4f}  (↓ лучше)')
+print(f'  energy_corr     : {final_metrics["energy_corr"]:.4f}  (↑ лучше)')
+print(f'  inter_track_corr: {final_metrics["inter_track_corr"]:.4f}  (↑ лучше)')
+print(f'  tc_score        : {final_metrics["tc_score"]:.4f}  (↓ лучше)')
+print(f'\n  KL per component (> 0.1 = not collapsed):')
+for comp, kl_v in final_metrics['kl_per_component'].items():
+    bar = '█' * int(kl_v * 10)
+    print(f'    {comp:<10}: {kl_v:.3f}  {bar}')
+
+with open(CKPT_DIR / 'test_metrics.json', 'w') as f:
+    json.dump(final_metrics, f, indent=2)
+print('Saved: test_metrics.json')
+
+# ============================================================
+# ВИЗУАЛИЗАЦИЯ
+# ============================================================
+
+print('\nGenerating plots...')
+
+# 1. Training curves
+fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+keys = ['total', 'recon', 'kl', 'energy', 'role', 'dis']
+titles = ['Total Loss', 'z Recon (MSE)', 'KL Divergence', 'Energy Loss', 'Role Aux Loss', 'TC Penalty']
+
+for ax, key, title in zip(axes.flat, keys, titles):
+    if f'train_{key}' in history:
+        ax.plot(history[f'train_{key}'], label='train', color='#3498db', lw=1.5)
+        ax.plot(history[f'val_{key}'], label='val', color='#e74c3c', lw=1.5)
+    ax.set_title(title, fontsize=11)
+    ax.legend(fontsize=9)
+    ax.set_xlabel('Epoch')
+    ax.grid(alpha=0.3)
+
+plt.suptitle('Structured Controller — Training Curves', fontsize=14)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'training_curves.png', dpi=150)
+plt.close()
+print(f'  Saved: {OUTPUT_DIR / "training_curves.png"}')
+
+# 2. KL per component bar chart
+comp_kls = final_metrics['kl_per_component']
+colors = ['#9b59b6', '#f39c12', '#e74c3c', '#2ecc71', '#3498db']
+
+fig, ax = plt.subplots(figsize=(8, 4))
+bars = ax.bar(comp_kls.keys(), comp_kls.values(), color=colors, edgecolor='white', width=0.5)
+ax.axhline(0.1, color='gray', linestyle='--', lw=1, label='collapse threshold')
+ax.set_title('KL Divergence per Latent Component', fontsize=11)
+ax.set_ylabel('Mean KL')
+ax.legend()
+ax.bar_label(bars, fmt='%.3f', padding=3, fontsize=9)
+ax.grid(alpha=0.3, axis='y')
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'kl_per_component.png', dpi=150)
+plt.close()
+print(f'  Saved: {OUTPUT_DIR / "kl_per_component.png"}')
+
+# 3. PCA latent space visualization
+from sklearn.decomposition import PCA
+
+z_all_parts = {k: [] for k in ['struct', 'energy', 'rhythm', 'harmony', 'melody']}
+with torch.no_grad():
+    for _, x_flat, _ in test_loader:
+        enc = controller.encode(x_flat.to(DEVICE))
+        for k in z_all_parts:
+            z_all_parts[k].append(enc['mu'][k].cpu().numpy())
+        if sum(len(v) for v in z_all_parts.values()) > 5 * 1000:
+            break
+
+z_concat = np.concatenate([np.concatenate(z_all_parts[k], 0) for k in z_all_parts], axis=1)[:1000]
+pca = PCA(n_components=2)
+z_2d = pca.fit_transform(z_concat)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+sc = ax.scatter(z_2d[:, 0], z_2d[:, 1], c=np.arange(len(z_2d)), cmap='viridis', alpha=0.4, s=8)
+plt.colorbar(sc, label='Sample index')
+ax.set_title('Structured Latent Space (PCA)')
+ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)')
+ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)')
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'latent_pca.png', dpi=150)
+plt.close()
+print(f'  Saved: {OUTPUT_DIR / "latent_pca.png"}')
+
+# ============================================================
+# ГЕНЕРАЦИЯ MIDI
 # ============================================================
 
 def decode_z_to_midi(z_parts, temperature=0.5, length=32):
@@ -487,13 +723,18 @@ def decode_z_to_midi(z_parts, temperature=0.5, length=32):
     z_np = z_mv_hat.cpu().numpy()
     return musicvae.decode(z_np, length=length, temperature=temperature)
 
-# Генерация 6 MIDI файлов
-print('\nGenerating MIDI files...')
+# Random generation
+print('\nGenerating random MIDI files...')
 for i in range(6):
     z_random = controller.sample_structured_z(1, DEVICE)
     seqs = decode_z_to_midi(z_random)
     out_path = OUTPUT_DIR / f'generated_{i+1:02d}.mid'
     note_seq.sequence_proto_to_midi_file(seqs[0], str(out_path))
-    print(f'Saved: {out_path}')
+    print(f'  Saved: {out_path.name}')
 
 print(f'\n✅ All done! Results in {OUTPUT_DIR}')
+print(f'  - MIDI files: {OUTPUT_DIR}/*.mid')
+print(f'  - Training curves: {OUTPUT_DIR}/training_curves.png')
+print(f'  - KL per component: {OUTPUT_DIR}/kl_per_component.png')
+print(f'  - PCA visualization: {OUTPUT_DIR}/latent_pca.png')
+print(f'  - Metrics JSON: {CKPT_DIR}/test_metrics.json')
