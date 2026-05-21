@@ -1,3 +1,4 @@
+magenta
 torch
 torchvision
 pretty_midi
